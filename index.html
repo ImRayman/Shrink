@@ -28,6 +28,7 @@
   --line-hover: #34343d;
   --trim: #ffc933;
   --trim-ink: #2a1f00;
+  --cut: #ff5a6a;
   --ok: #34d17f;
   --bad: #ff6a5f;
   --sans: "Geist", "SF Pro Text", system-ui, -apple-system, sans-serif;
@@ -72,6 +73,16 @@ h1 i { width: 8px; height: 8px; border-radius: 50%; background: var(--ink); disp
 .h.l { left: -20px; } .h.r { right: -20px; }
 .h:focus-visible::after { box-shadow: 0 0 0 3px var(--ink); }
 .head { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--ink); border-radius: 2px; pointer-events: none; box-shadow: 0 0 0 1px rgba(0,0,0,.4); }
+.cuts { position: absolute; inset: 0 14px; pointer-events: none; }
+.cut { position: absolute; top: 4px; bottom: 4px; pointer-events: auto; cursor: grab; background: repeating-linear-gradient(135deg, rgba(255,90,106,.62) 0 5px, rgba(255,90,106,.28) 5px 10px); box-shadow: inset 0 2px 0 var(--cut), inset 0 -2px 0 var(--cut); }
+.cut:active { cursor: grabbing; }
+.cut .ch { position: absolute; top: -4px; bottom: -4px; width: 12px; cursor: ew-resize; display: grid; place-items: center; }
+.cut .ch::after { content: ""; width: 4px; height: 100%; border-radius: 3px; background: var(--cut); }
+.cut .ch.l { left: -6px; } .cut .ch.r { right: -6px; }
+.cut .x { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 22px; height: 22px; border-radius: 50%; border: 0; padding: 0; background: var(--cut); color: #fff; font: 600 14px/22px var(--sans); cursor: pointer; opacity: 0; transition: opacity .15s; }
+.cut:hover .x, .cut:focus-within .x { opacity: 1; }
+.play.cutbtn { color: var(--cut); }
+.play.cutbtn svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 .trim.locked { pointer-events: none; opacity: .5; }
 .times { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; padding: 0 2px; }
 .times b { color: var(--trim); font-weight: 500; }
@@ -110,9 +121,11 @@ h1 i { width: 8px; height: 8px; border-radius: 50%; background: var(--ink); disp
 
     <div class="trim" id="trim" hidden>
       <button class="play" id="play" aria-label="Play"><svg viewBox="0 0 24 24" id="playIcon"><path d="M7 4.5v15l13-7.5z"/></svg></button>
+      <button class="play cutbtn" id="cutBtn" aria-label="Cut out a section" title="Cut out a section at the playhead"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.6 7.6 20 18M8.6 16.4 20 6"/></svg></button>
       <div class="strip" id="strip">
         <div class="frames" id="frames"></div>
         <div class="shade l" id="shadeL"></div><div class="shade r" id="shadeR"></div>
+        <div class="cuts" id="cuts"></div>
         <div class="sel" id="sel"></div>
         <span class="h l" id="hL" tabindex="0" role="slider" aria-label="Trim start"></span>
         <span class="h r" id="hR" tabindex="0" role="slider" aria-label="Trim end"></span>
@@ -131,7 +144,7 @@ const $ = id => document.getElementById(id);
 const MB = 1e6, LIMIT = 10 * MB, TARGET = LIMIT * 0.94, MIN_LEN = 0.3, PAD = 14;
 const MEDIABUNNY_URL = './mediabunny.min.mjs';
 let MBN = null, src = null, busy = false, out = null, downloads = null, vidUrl = null;
-let tStart = 0, tEnd = 0, thumbJob = 0;
+let tStart = 0, tEnd = 0, thumbJob = 0, cuts = [];
 const vid = $('vid');
 
 const fmt = b => (b / MB).toFixed(1) + ' MB';
@@ -141,7 +154,27 @@ const meta = (html, err) => { $('meta').innerHTML = html; $('meta').classList.to
 const progress = p => { $('fill').style.width = (p * 100) + '%'; };
 const label = t => { $('goLabel').textContent = t; };
 const trimmed = () => src && (tStart > 0.05 || tEnd < src.duration - 0.05);
-const len = () => tEnd - tStart;
+// cuts are removed sections inside the trim; clamp them to the trim and merge overlaps
+function liveCuts() {
+  const cs = cuts.map(c => ({ a: Math.max(c.a, tStart), b: Math.min(c.b, tEnd) })).filter(c => c.b - c.a > 0.02).sort((x, y) => x.a - y.a);
+  const m = [];
+  for (const c of cs) { const l = m[m.length - 1]; if (l && c.a <= l.b) l.b = Math.max(l.b, c.b); else m.push({ ...c }); }
+  return m;
+}
+const len = () => (tEnd - tStart) - liveCuts().reduce((s, c) => s + c.b - c.a, 0);
+const cutAt = t => liveCuts().find(c => t >= c.a && t < c.b);
+// drop samples inside a cut and pull later ones back so the video plays straight through
+function cutProcess(sample) {
+  const cs = liveCuts();
+  const t = sample.timestamp + tStart;
+  let removed = 0;
+  for (const c of cs) {
+    if (t >= c.a && t < c.b) return null;
+    if (t >= c.b) removed += c.b - c.a;
+  }
+  if (removed) sample.setTimestamp(sample.timestamp - removed);
+  return sample;
+}
 
 function reset() {
   out = null; progress(0);
@@ -168,6 +201,8 @@ function plan(s, dur, videoOverride) {
 function describe() {
   if (!src) return;
   const est = src.size * len() / src.duration;
+  if (len() < MIN_LEN) { meta('Nothing left to keep — make a cut smaller.', true); $('go').disabled = true; return; }
+  if (!busy && !out) $('go').disabled = !MBN;
   meta(est <= TARGET ? `<b>${len().toFixed(1)} s</b> · already about ${fmt(est)} — shrinking makes it smaller still`
                      : `<b>${len().toFixed(1)} s</b> · ${fmt(est)} → under <b>10 MB</b>`);
 }
@@ -188,7 +223,7 @@ async function loadFile(file) {
     src = { file, duration, w: vt.displayWidth, h: vt.displayHeight, fps, hasAudio: !!at, size: file.size, track: vt };
   } catch (e) { meta(e.message || String(e), true); return; }
 
-  tStart = 0; tEnd = src.duration;
+  tStart = 0; tEnd = src.duration; cuts = [];
   if (vidUrl) URL.revokeObjectURL(vidUrl);
   vidUrl = URL.createObjectURL(file);
   vid.src = vidUrl; vid.hidden = false; vid.currentTime = 0;
@@ -235,7 +270,9 @@ function layoutTrim() {
   $('shadeL').style.width = `calc((100% - ${PAD * 2}px) * ${a})`;
   $('shadeR').style.width = `calc((100% - ${PAD * 2}px) * ${1 - b})`;
   $('tIn').textContent = fmtT(tStart); $('tOut').textContent = fmtT(tEnd);
-  $('tLen').textContent = len().toFixed(1) + ' s';
+  const nc = liveCuts().length;
+  $('tLen').textContent = len().toFixed(1) + ' s' + (nc ? ` · ${nc} cut${nc > 1 ? 's' : ''}` : '');
+  $('cuts').innerHTML = cuts.map((c, i) => `<div class="cut" data-i="${i}" style="left:${c.a / d * 100}%;width:${(c.b - c.a) / d * 100}%"><span class="ch l"></span><span class="ch r"></span><button class="x" aria-label="Remove cut">×</button></div>`).join('');
   $('hL').setAttribute('aria-valuenow', tStart.toFixed(1)); $('hR').setAttribute('aria-valuenow', tEnd.toFixed(1));
   drawHead();
 }
@@ -257,11 +294,39 @@ function setTrim(which, t) {
   if (out) reset();
   layoutTrim(); describe();
 }
+function editCut(i, kind, t, off) {
+  const c = cuts[i], w = c.b - c.a;
+  if (kind === 'cl') c.a = Math.min(Math.max(t, tStart), c.b - 0.1);
+  else if (kind === 'cr') c.b = Math.max(Math.min(t, tEnd), c.a + 0.1);
+  else { c.a = Math.min(Math.max(t - off, tStart), tEnd - w); c.b = c.a + w; }
+  vid.pause();
+  vid.currentTime = kind === 'cr' ? c.b : c.a;
+  if (out) reset();
+  layoutTrim(); describe();
+}
+function addCut() {
+  if (!src || busy) return;
+  const span = tEnd - tStart, w = Math.max(0.2, Math.min(2, span * 0.15));
+  let t = Math.min(Math.max(vid.currentTime, tStart), tEnd);
+  const a = Math.min(Math.max(t - w / 2, tStart), tEnd - w);
+  cuts.push({ a, b: a + w });
+  vid.pause();
+  if (out) reset();
+  layoutTrim(); describe();
+}
+$('cutBtn').addEventListener('click', addCut);
 
 let drag = null;
 $('strip').addEventListener('pointerdown', e => {
   if (!src || busy) return;
-  const h = e.target.closest('.h');
+  const x = e.target.closest('.x'), c = e.target.closest('.cut'), h = e.target.closest('.h');
+  if (x && c) { cuts.splice(+c.dataset.i, 1); if (out) reset(); layoutTrim(); describe(); return; }
+  if (c) {
+    const i = +c.dataset.i, ch = e.target.closest('.ch');
+    drag = { i, kind: ch ? (ch.classList.contains('l') ? 'cl' : 'cr') : 'cm', off: timeAt(e.clientX) - cuts[i].a };
+    $('strip').setPointerCapture(e.pointerId);
+    return;
+  }
   drag = h ? (h.id === 'hL' ? 'l' : 'r') : 'seek';
   $('strip').setPointerCapture(e.pointerId);
   move(e);
@@ -271,6 +336,7 @@ $('strip').addEventListener('pointermove', e => { if (drag) move(e); });
 function move(e) {
   const t = timeAt(e.clientX);
   if (drag === 'seek') { vid.currentTime = Math.min(Math.max(t, tStart), tEnd); drawHead(); }
+  else if (typeof drag === 'object') editCut(drag.i, drag.kind, t, drag.off);
   else setTrim(drag, t);
 }
 ['hL', 'hR'].forEach(id => $(id).addEventListener('keydown', e => {
@@ -284,6 +350,7 @@ function togglePlay() {
   if (!src) return;
   if (vid.paused) {
     if (vid.currentTime < tStart || vid.currentTime >= tEnd - 0.05) vid.currentTime = tStart;
+    const c = cutAt(vid.currentTime); if (c) vid.currentTime = c.b >= tEnd ? tStart : c.b;
     vid.play().catch(() => {});
   } else vid.pause();
 }
@@ -293,6 +360,8 @@ vid.addEventListener('pause', () => { $('playIcon').innerHTML = PLAY; $('play').
 function tick() {
   if (vid.paused) return;
   if (vid.currentTime >= tEnd) vid.currentTime = tStart;
+  const c = cutAt(vid.currentTime);
+  if (c) vid.currentTime = c.b >= tEnd ? tStart : c.b;
   drawHead(); requestAnimationFrame(tick);
 }
 vid.addEventListener('seeked', drawHead);
@@ -316,8 +385,8 @@ async function encode(p) {
     output: new M.Output({ format: mp4 ? new M.Mp4OutputFormat({ fastStart: 'in-memory' }) : new M.WebMOutputFormat(), target }),
     tracks: 'primary', showWarnings: false,
     trim: trimmed() ? { start: tStart, end: tEnd } : undefined,
-    video: { width: p.w, height: p.h, fit: 'fill', frameRate: p.fps, codec: vcodec, quality: new M.Quality({ bitrate: p.videoBps, bitrateMode: 'variable' }), forceTranscode: true, keyFrameInterval: 4 },
-    audio: p.audioBps ? { codec: acodec, quality: new M.Quality({ bitrate: p.audioBps }), numberOfChannels: 2, forceTranscode: true } : { discard: true },
+    video: { width: p.w, height: p.h, fit: 'fill', frameRate: p.fps, codec: vcodec, quality: new M.Quality({ bitrate: p.videoBps, bitrateMode: 'variable' }), forceTranscode: true, keyFrameInterval: 4, ...(liveCuts().length ? { process: cutProcess } : {}) },
+    audio: p.audioBps ? { codec: acodec, quality: new M.Quality({ bitrate: p.audioBps }), forceTranscode: true, ...(liveCuts().length ? { process: cutProcess } : {}) } : { discard: true },
   });
   if (!conv.isValid) throw new Error('This video can’t be converted here.');
   conv.onProgress = progress;
@@ -369,7 +438,7 @@ async function save() {
   meta('Saved <b>' + out.name.replace(/</g, '&lt;') + '</b> to Downloads');
 }
 
-$('go').addEventListener('click', () => { if (busy || !src) return; out ? save() : shrink(); });
+$('go').addEventListener('click', () => { if (busy || !src || len() < MIN_LEN) return; out ? save() : shrink(); });
 
 // ---- file in ----
 $('file').addEventListener('change', e => { loadFile(e.target.files[0]); e.target.value = ''; });
